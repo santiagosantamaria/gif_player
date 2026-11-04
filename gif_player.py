@@ -11,6 +11,7 @@ Right-click the picture and choose Close, or press Ctrl+Shift+Q, to quit.
 from __future__ import annotations
 
 import ctypes
+import math
 import sys
 import time
 from ctypes import wintypes
@@ -957,14 +958,23 @@ def run() -> None:
         now = time.perf_counter()
         if animated and now >= APP.next_frame:
             APP.index = (APP.index + 1) % len(APP.frames)
-            APP.next_frame = now + APP.delays[APP.index] / 1000
+            # Count from the deadline, not from when Windows woke us. Wake-ups
+            # land on a ~15.6 ms tick, and counting from "now" made every frame
+            # that much too long.
+            APP.next_frame += APP.delays[APP.index] / 1000
+            if APP.next_frame <= now:
+                # A whole frame behind (menu open, PC asleep): restart the clock
+                # instead of racing through frames to catch up.
+                APP.next_frame = now + APP.delays[APP.index] / 1000
         present()
         if not APP.running:
             break
         remaining = APP.next_frame - time.perf_counter() if animated else 1.0
         if remaining <= 0:
             continue
-        wait_ms = min(1000, max(1, int(remaining * 1000)))
+        # Round up so the wait never ends just before the deadline and needs a
+        # second wake-up for the same frame.
+        wait_ms = min(1000, max(1, math.ceil(remaining * 1000)))
         user32.MsgWaitForMultipleObjects(0, None, False, wait_ms, QS_ALLINPUT)
         pump()
 
