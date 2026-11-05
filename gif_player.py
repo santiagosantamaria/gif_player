@@ -5,7 +5,8 @@ Change the settings under "Settings", then double-click play.bat.
 Drag anywhere inside the picture to move it. Drag an edge or a corner
 to resize it; width and height stay in the GIF's original proportion.
 Nothing is drawn around the picture, and transparent pixels stay clear.
-Right-click the picture and choose Close, or press Ctrl+Shift+Q, to quit.
+Right-click the picture and choose Pause or Play to stop or restart
+the animation. Choose Close, or press Ctrl+Shift+Q, to quit.
 """
 
 from __future__ import annotations
@@ -108,7 +109,9 @@ SC_MINIMIZE = 0xF020
 SC_MAXIMIZE = 0xF030
 SC_CLOSE = 0xF060
 CMD_CLOSE = 1
+CMD_PAUSE = 2
 MF_STRING = 0x0000
+MF_SEPARATOR = 0x0800
 TPM_RIGHTBUTTON = 0x0002
 TPM_NONOTIFY = 0x0080
 TPM_RETURNCMD = 0x0100
@@ -120,6 +123,7 @@ BI_RGB = 0
 DIB_RGB_COLORS = 0
 PM_REMOVE = 0x0001
 QS_ALLINPUT = 0x04FF
+INFINITE = 0xFFFFFFFF
 SPI_GETWORKAREA = 0x0030
 MOD_NOREPEAT = 0x4000
 
@@ -320,6 +324,9 @@ class App:
         self.hotkey = False
         self.edge_px = EDGE_PX
         self.next_frame = 0.0
+        self.paused = False
+        # Time the current frame still had on screen when Pause was chosen.
+        self.pause_left = 0.0
 
 
 APP = App()
@@ -780,13 +787,29 @@ def request_quit() -> None:
     user32.PostQuitMessage(0)
 
 
-def show_close_menu(hwnd) -> None:
+def toggle_pause() -> None:
+    now = time.perf_counter()
+    if APP.paused:
+        # Pick up the current frame where it stopped, not from the start.
+        APP.next_frame = now + APP.pause_left
+        APP.paused = False
+    else:
+        APP.pause_left = max(0.0, APP.next_frame - now)
+        APP.paused = True
+
+
+def show_menu(hwnd) -> None:
     if APP.drag is not None:
         end_drag()
     menu = user32.CreatePopupMenu()
     if not menu:
         return
     try:
+        if len(APP.frames) > 1:
+            label = "Play" if APP.paused else "Pause"
+            if not user32.AppendMenuW(menu, MF_STRING, CMD_PAUSE, label):
+                return
+            user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         if not user32.AppendMenuW(menu, MF_STRING, CMD_CLOSE, "Close"):
             return
         x, y = cursor_pos()
@@ -798,7 +821,9 @@ def show_close_menu(hwnd) -> None:
             x, y, 0, hwnd, None,
         )
         user32.PostMessageW(hwnd, WM_NULL, 0, 0)
-        if command == CMD_CLOSE:
+        if command == CMD_PAUSE:
+            toggle_pause()
+        elif command == CMD_CLOSE:
             request_quit()
     finally:
         user32.DestroyMenu(menu)
@@ -829,7 +854,7 @@ def wnd_proc(hwnd, msg, wparam, lparam):
             end_drag()
             return 0
         if msg == WM_RBUTTONUP:
-            show_close_menu(hwnd)
+            show_menu(hwnd)
             return 0
         if msg == WM_MOUSEMOVE:
             update_drag()
@@ -955,8 +980,9 @@ def run() -> None:
     APP.next_frame = time.perf_counter() + APP.delays[APP.index] / 1000
     animated = len(APP.frames) > 1
     while APP.running:
+        playing = animated and not APP.paused
         now = time.perf_counter()
-        if animated and now >= APP.next_frame:
+        if playing and now >= APP.next_frame:
             APP.index = (APP.index + 1) % len(APP.frames)
             # Count from the deadline, not from when Windows woke us. Wake-ups
             # land on a ~15.6 ms tick, and counting from "now" made every frame
@@ -969,12 +995,16 @@ def run() -> None:
         present()
         if not APP.running:
             break
-        remaining = APP.next_frame - time.perf_counter() if animated else 1.0
-        if remaining <= 0:
-            continue
-        # Round up so the wait never ends just before the deadline and needs a
-        # second wake-up for the same frame.
-        wait_ms = min(1000, max(1, math.ceil(remaining * 1000)))
+        if playing:
+            remaining = APP.next_frame - time.perf_counter()
+            if remaining <= 0:
+                continue
+            # Round up so the wait never ends just before the deadline and
+            # needs a second wake-up for the same frame.
+            wait_ms = min(1000, max(1, math.ceil(remaining * 1000)))
+        else:
+            # Paused or a still image: sleep until a click, the hotkey or Close.
+            wait_ms = INFINITE
         user32.MsgWaitForMultipleObjects(0, None, False, wait_ms, QS_ALLINPUT)
         pump()
 
