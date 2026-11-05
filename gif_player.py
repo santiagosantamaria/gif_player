@@ -1,14 +1,16 @@
-"""Play a GIF on the Windows desktop with no window chrome.
+"""Play GIFs on the Windows desktop with no window chrome.
 
 Change the settings under "Settings", then double-click play.bat.
 
-Drag anywhere inside the picture to move it. Drag an edge or a corner
-to resize it; width and height stay in the GIF's original proportion.
-Nothing is drawn around the picture, and transparent pixels stay clear.
+Every GIF in GIFS opens in its own window, and each one has the same
+controls. Drag a picture to move it. Drag an edge or a corner to resize
+it; width and height stay in the GIF's original proportion. Nothing is
+drawn around the picture, and transparent pixels stay clear.
 Right-click and choose Enable rotate, then hover the picture and drag the
-round button in its top-left corner to rotate it. Double-click the picture to stand it upright again.
-Right-click the picture and choose Pause or Play to stop or restart
-the animation. Choose Close, or press Ctrl+Shift+Q, to quit.
+round button in its top-left corner to rotate it. Double-click the
+picture to stand it upright again.
+Right-click a picture and choose Pause or Play to stop or restart its
+animation, or Close to close it. Press Ctrl+Shift+Q to close them all.
 """
 
 from __future__ import annotations
@@ -27,8 +29,16 @@ from PIL import Image, ImageChops, ImageDraw
 # Settings
 # ---------------------------------------------------------------------------
 
-# File name inside the images folder next to this script.
-GIF_NAME = "sonic_wait.gif"
+# GIFs to play, from the images folder next to this script. Each one opens
+# in its own window. An entry is a file name, or a dict that gives that GIF
+# its own settings in place of the ones below. For example:
+#     {"file": "sonic_run.gif", "position": "bottom-right", "scale": 2,
+#      "speed": 1.5, "rotate": True}
+# GIFs without their own "position" are placed side by side around POSITION.
+GIFS = [
+    "sonic_wait.gif",
+    "sonic_run.gif",
+]
 
 # 1.0 is the GIF's own frame timing. 2.0 plays twice as fast, 0.5 half speed.
 SPEED = 1.0
@@ -41,10 +51,11 @@ SCALE = 1.0
 # "top", "bottom", "left", "right", or an (x, y) pixel pair.
 POSITION = "center"
 
-# Gap from the screen edge for the named corner and side positions.
+# Gap from the screen edge for the named corner and side positions, and
+# between GIFs that are placed side by side.
 MARGIN = 24
 
-# Keep the picture above other windows.
+# Keep the pictures above other windows.
 ALWAYS_ON_TOP = True
 
 # How thick the invisible resize edge is, at 96 DPI. The edge is not drawn;
@@ -69,7 +80,7 @@ ROTATE_ENABLED = False
 # degrees away from it. 0 turns snapping off.
 ROTATE_SNAP = 3
 
-# Global quit shortcut.
+# Global shortcut that closes every GIF.
 QUIT_MODIFIERS = ("ctrl", "shift")
 QUIT_KEY = "q"
 
@@ -130,6 +141,7 @@ SC_CLOSE = 0xF060
 CMD_CLOSE = 1
 CMD_PAUSE = 2
 CMD_ROTATE = 3
+CMD_CLOSE_ALL = 4
 MF_STRING = 0x0000
 MF_SEPARATOR = 0x0800
 TPM_RIGHTBUTTON = 0x0002
@@ -146,6 +158,7 @@ QS_ALLINPUT = 0x04FF
 INFINITE = 0xFFFFFFFF
 SPI_GETWORKAREA = 0x0030
 MOD_NOREPEAT = 0x4000
+HOTKEY_ID = 1
 
 IDC_SIZENWSE = 32642
 IDC_SIZENESW = 32643
@@ -154,7 +167,7 @@ IDC_SIZENS = 32645
 IDC_SIZEALL = 32646
 IDC_HAND = 32649
 
-# While the pointer is over the picture's box but not its pixels (they let
+# While the pointer is over a picture's box but not its pixels (they let
 # clicks through), check this often whether it has left, to hide the button.
 HOVER_TIMER = 7
 HOVER_POLL_MS = 250
@@ -191,6 +204,7 @@ _ROTATE_FILTERS = {
     "bilinear": Image.Resampling.BILINEAR,
     "lanczos": Image.Resampling.BICUBIC,
 }
+_GIF_OPTIONS = ("file", "position", "scale", "speed", "rotate")
 
 
 class POINT(ctypes.Structure):
@@ -319,66 +333,36 @@ class Surface:
 
 
 class Drag:
-    """Where the picture was when a move, resize or rotate drag started."""
+    """Where a picture was when a move, resize or rotate drag started."""
 
-    def __init__(self, zone: str, start_x: int, start_y: int) -> None:
+    def __init__(self, player: Player, zone: str, start_x: int, start_y: int) -> None:
         self.zone = zone
         self.start_x = start_x
         self.start_y = start_y
-        self.orig_x, self.orig_y = APP.x, APP.y
-        self.orig_w, self.orig_h = APP.w, APP.h
-        self.orig_sw, self.orig_sh = APP.sw, APP.sh
-        self.orig_angle = APP.angle
-        self.center_x = APP.x + APP.w / 2
-        self.center_y = APP.y + APP.h / 2
-        self.grab_x = start_x - APP.x
-        self.grab_y = start_y - APP.y
+        self.orig_x, self.orig_y = player.x, player.y
+        self.orig_w, self.orig_h = player.w, player.h
+        self.orig_sw, self.orig_sh = player.sw, player.sh
+        self.orig_angle = player.angle
+        self.center_x = player.x + player.w / 2
+        self.center_y = player.y + player.h / 2
+        self.grab_x = start_x - player.x
+        self.grab_y = start_y - player.y
 
 
 class App:
+    """What all the GIF windows share."""
+
     def __init__(self) -> None:
-        self.hwnd = None
         self.hinstance = None
         self.class_name = "DesktopGifPlayer"
+        self.class_registered = False
         self.running = True
-        self.frames: list[Image.Image] = []
-        self.native_bytes: list[bytes] = []
-        self.delays: list[int] = []
-        self.index = 0
-        self.native_w = 1
-        self.native_h = 1
-        # The window box. When rotated it is larger than the picture.
-        self.x = 0
-        self.y = 0
-        self.w = 1
-        self.h = 1
-        # The picture's own size before rotation, and the rotation in degrees
-        # clockwise. 0 is upright.
-        self.sw = 1
-        self.sh = 1
-        self.angle = 0.0
-        self.drag: Drag | None = None
-        self.surface = Surface()
-        self.cache_key: tuple[int, int, float] | None = None
-        self.cache: dict[int, bytes] = {}
-        self.presented: tuple[int, int, int, int] | None = None
-        self.in_present = False
         self.error: BaseException | None = None
         self.cursors: dict[str, int] = {}
         self.hotkey = False
-        self.edge_px = EDGE_PX
-        self.next_frame = 0.0
-        self.paused = False
-        # Time the current frame still had on screen when Pause was chosen.
-        self.pause_left = 0.0
-        # The rotate button: a small window of its own, shown on hover while
-        # rotating is enabled from the menu.
-        self.rotate_enabled = bool(ROTATE_ENABLED)
-        self.handle_hwnd = None
-        self.handle_surface = Surface()
-        self.handle_size = ROTATE_BUTTON_PX
-        self.handle_visible = False
-        self.handle_pos: tuple[int, int] | None = None
+        self.players: list[Player] = []
+        # Window handle -> (player, is its rotate button)
+        self.windows: dict[int, tuple[Player, bool]] = {}
 
 
 APP = App()
@@ -529,6 +513,10 @@ def bind_win32() -> None:
     gdi32.CreateDIBSection.restype = wintypes.HBITMAP
 
 
+# ---------------------------------------------------------------------------
+# Loading and settings
+# ---------------------------------------------------------------------------
+
 def premultiply(image: Image.Image) -> Image.Image:
     image = image.convert("RGBA")
     red, green, blue, alpha = image.split()
@@ -566,6 +554,66 @@ def load_gif(path: Path, speed: float) -> tuple[list[Image.Image], list[bytes], 
     native = frames[0].size
     return frames, [frame.tobytes() for frame in frames], delays, native
 
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def check_settings() -> None:
+    if RESAMPLE not in _FILTERS:
+        fail("RESAMPLE must be nearest, bilinear, or lanczos.")
+
+
+def gif_specs() -> list[dict]:
+    """GIFS as a list of {"file", "position", "scale", "speed", "rotate"}."""
+    entries = [GIFS] if isinstance(GIFS, (str, dict)) else list(GIFS or [])
+    if not entries:
+        fail("Add at least one GIF file name to GIFS.")
+    specs = []
+    for entry in entries:
+        if isinstance(entry, str):
+            entry = {"file": entry}
+        if not isinstance(entry, dict):
+            fail(f"Each GIFS entry must be a file name or a dict, not {entry!r}.")
+        unknown = [key for key in entry if key not in _GIF_OPTIONS]
+        if unknown:
+            fail(f"Unknown GIFS option {unknown[0]!r}. Use: {', '.join(_GIF_OPTIONS)}.")
+        name = str(entry.get("file") or "").strip()
+        if not name:
+            fail(f"This GIFS entry has no file name: {entry!r}")
+        speed = entry.get("speed", SPEED)
+        if not _is_number(speed) or speed <= 0:
+            fail(f"{name}: speed must be a number greater than 0. Use 1 for the GIF's own timing.")
+        scale = entry.get("scale", SCALE)
+        if not _is_number(scale) or scale <= 0:
+            fail(f"{name}: scale must be a number greater than 0.")
+        specs.append({
+            "file": name,
+            "position": entry.get("position"),
+            "scale": float(scale),
+            "speed": float(speed),
+            "rotate": bool(entry.get("rotate", ROTATE_ENABLED)),
+        })
+    return specs
+
+
+def gif_path(name: str) -> Path:
+    images = Path(__file__).resolve().parent / "images"
+    path = images / name
+    if path.is_file():
+        return path
+    found = sorted(item.name for item in images.glob("*.gif")) if images.is_dir() else []
+    listing = "\n".join(found) if found else "(no .gif files yet)"
+    fail(
+        f"Could not find {name} in {images}.\n\n"
+        f"Put the GIF in that folder and add its file name to GIFS.\n\n{listing}"
+    )
+    raise AssertionError
+
+
+# ---------------------------------------------------------------------------
+# Geometry
+# ---------------------------------------------------------------------------
 
 def size_from_width(width: int, native_w: int, native_h: int, min_size: int) -> tuple[int, int]:
     width = max(min_size, int(round(width)))
@@ -649,6 +697,19 @@ def hit_zone(px: int, py: int, width: int, height: int, edge: int) -> str:
     return "move"
 
 
+def rotated_size(width: int, height: int, angle: float) -> tuple[int, int]:
+    """The box a width x height picture needs once rotated by angle."""
+    if angle % 180 == 0:
+        return width, height
+    if angle % 180 == 90:
+        return height, width
+    turn = math.radians(angle)
+    cos, sin = abs(math.cos(turn)), abs(math.sin(turn))
+    box_w = math.ceil(round(width * cos + height * sin, 6))
+    box_h = math.ceil(round(width * sin + height * cos, 6))
+    return max(1, box_w), max(1, box_h)
+
+
 def work_area() -> RECT:
     area = RECT()
     if not user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(area), 0):
@@ -692,244 +753,51 @@ def resolve_position(position, win_w: int, win_h: int, area: RECT) -> tuple[int,
     name = str(position).strip().lower().replace("_", "-")
     if name not in anchors:
         names = ", ".join(anchors)
-        fail(f"POSITION must be one of: {names}. Or set it to an (x, y) pair.")
+        fail(f"Position must be one of: {names}. Or set it to an (x, y) pair. Got {position!r}.")
     return anchors[name]
 
 
-def check_settings() -> None:
-    if not isinstance(SPEED, (int, float)) or isinstance(SPEED, bool) or SPEED <= 0:
-        fail("SPEED must be a number greater than 0. Use 1 for the GIF's own timing.")
-    if not isinstance(SCALE, (int, float)) or isinstance(SCALE, bool) or SCALE <= 0:
-        fail("SCALE must be a number greater than 0.")
-    if RESAMPLE not in _FILTERS:
-        fail("RESAMPLE must be nearest, bilinear, or lanczos.")
-    if not GIF_NAME or not str(GIF_NAME).strip():
-        fail("Set GIF_NAME to a file inside the images folder.")
+def lay_out(players: list[Player], area: RECT) -> None:
+    """Place GIFs that have their own position there; line up the rest.
 
-
-def gif_path() -> Path:
-    images = Path(__file__).resolve().parent / "images"
-    path = images / GIF_NAME
-    if path.is_file():
-        return path
-    found = sorted(item.name for item in images.glob("*.gif")) if images.is_dir() else []
-    listing = "\n".join(found) if found else "(no .gif files yet)"
-    fail(
-        f"Could not find {GIF_NAME} in {images}.\n\n"
-        f"Put the GIF in that folder and set GIF_NAME to its file name.\n\n{listing}"
-    )
-    raise AssertionError
-
-
-def cursor_pos() -> tuple[int, int]:
-    point = POINT()
-    _check(user32.GetCursorPos(ctypes.byref(point)), "GetCursorPos")
-    return int(point.x), int(point.y)
-
-
-def apply_cursor(zone: str) -> None:
-    cursor = APP.cursors.get(zone) or APP.cursors.get("move")
-    if cursor:
-        user32.SetCursor(cursor)
-
-
-def current_zone() -> str:
-    if APP.drag is not None:
-        return APP.drag.zone
-    cx, cy = cursor_pos()
-    return hit_zone(cx - APP.x, cy - APP.y, APP.w, APP.h, APP.edge_px)
-
-
-def rotated_size(width: int, height: int, angle: float) -> tuple[int, int]:
-    """The box a width x height picture needs once rotated by angle."""
-    if angle % 180 == 0:
-        return width, height
-    if angle % 180 == 90:
-        return height, width
-    turn = math.radians(angle)
-    cos, sin = abs(math.cos(turn)), abs(math.sin(turn))
-    box_w = math.ceil(round(width * cos + height * sin, 6))
-    box_h = math.ceil(round(width * sin + height * cos, 6))
-    return max(1, box_w), max(1, box_h)
-
-
-def render_frame(index: int, width: int, height: int) -> bytes:
-    """Frame `index` at the current size and angle, as premultiplied BGRA."""
-    frame = APP.frames[index]
-    sw, sh, angle = APP.sw, APP.sh, APP.angle
-    if angle == 0:
-        if frame.size != (sw, sh):
-            frame = frame.resize((sw, sh), _FILTERS[RESAMPLE])
-        return frame.tobytes()
-    # Scale and rotate in one step: map each pixel of the window box back to
-    # the GIF frame around both centres.
-    native_w, native_h = frame.size
-    turn = math.radians(angle)
-    cos, sin = round(math.cos(turn), 12), round(math.sin(turn), 12)
-    step_x, step_y = native_w / sw, native_h / sh
-    a, b = cos * step_x, sin * step_x
-    d, e = -sin * step_y, cos * step_y
-    c = native_w / 2 - a * width / 2 - b * height / 2
-    f = native_h / 2 - d * width / 2 - e * height / 2
-    if angle % 90 == 0 or RESAMPLE != "nearest":
-        resample = _ROTATE_FILTERS[RESAMPLE]
-    else:
-        # Hard pixels look torn at a slant; smooth them.
-        resample = Image.Resampling.BILINEAR
-    rotated = frame.transform(
-        (width, height), Image.Transform.AFFINE, (a, b, c, d, e, f), resample
-    )
-    return rotated.tobytes()
-
-
-def frame_pixels(index: int, width: int, height: int) -> bytes:
-    if APP.angle == 0 and (APP.sw, APP.sh) == (APP.native_w, APP.native_h):
-        return APP.native_bytes[index]
-    reshaping = APP.drag is not None and APP.drag.zone != "move"
-    if reshaping:
-        return render_frame(index, width, height)
-    frame_bytes = width * height * 4
-    if frame_bytes * len(APP.frames) > 32 * 1024 * 1024:
-        return render_frame(index, width, height)
-    key = (APP.sw, APP.sh, APP.angle)
-    if APP.cache_key != key:
-        APP.cache_key = key
-        APP.cache = {}
-    cached = APP.cache.get(index)
-    if cached is None:
-        cached = render_frame(index, width, height)
-        APP.cache[index] = cached
-    return cached
-
-
-def present() -> None:
-    if APP.in_present or not APP.hwnd:
+    The rest stand side by side on a shared baseline, MARGIN apart, wrapping
+    to a new row when the screen is full. The whole group sits at POSITION.
+    """
+    lined_up = []
+    for player in players:
+        if player.position is None:
+            lined_up.append(player)
+        else:
+            player.x, player.y = resolve_position(player.position, player.w, player.h, area)
+    if not lined_up:
         return
-    APP.in_present = True
-    try:
-        width, height = APP.w, APP.h
-        if width < 1 or height < 1:
-            return
-        if APP.surface.size != (width, height):
-            APP.surface.rebuild(width, height)
-        if APP.surface.frame != APP.index:
-            data = frame_pixels(APP.index, width, height)
-            ctypes.memmove(APP.surface.bits, data, width * height * 4)
-            APP.surface.frame = APP.index
-        key = (APP.index, APP.x, APP.y, width, height)
-        if key == APP.presented:
-            return
-        origin = POINT(APP.x, APP.y)
-        size = SIZE(width, height)
-        source = POINT(0, 0)
-        ok = user32.UpdateLayeredWindow(
-            APP.hwnd, None, ctypes.byref(origin), ctypes.byref(size),
-            APP.surface.mem_dc, ctypes.byref(source), 0, ctypes.byref(BLEND), ULW_ALPHA,
-        )
-        if not ok:
-            raise ctypes.WinError(ctypes.get_last_error(), "UpdateLayeredWindow failed")
-        APP.presented = key
-        place_handle()
-    except Exception as exc:
-        APP.error = exc
-        APP.running = False
-    finally:
-        APP.in_present = False
-
-
-def begin_drag(zone: str | None = None, capture=None) -> None:
-    cx, cy = cursor_pos()
-    if zone is None:
-        zone = hit_zone(cx - APP.x, cy - APP.y, APP.w, APP.h, APP.edge_px)
-    APP.drag = Drag(zone, cx, cy)
-    user32.SetCapture(capture or APP.hwnd)
-    apply_cursor(zone)
-
-
-def set_angle(angle: float, center_x: float, center_y: float) -> None:
-    """Rotate to `angle` degrees clockwise, keeping the picture's centre still."""
-    angle %= 360.0
-    straight = round(angle / 90) * 90
-    if abs(angle - straight) < ROTATE_SNAP:
-        angle = float(straight % 360)
-    if angle == APP.angle:
-        return
-    APP.angle = angle
-    APP.w, APP.h = rotated_size(APP.sw, APP.sh, angle)
-    APP.x = int(round(center_x - APP.w / 2))
-    APP.y = int(round(center_y - APP.h / 2))
-    APP.surface.frame = -1
-    APP.presented = None
-
-
-def resize_drag(drag: Drag, cx: int, cy: int) -> None:
-    upright = drag.orig_angle == 0
-    # Upright, keep the GIF's own proportion exactly. Rotated, the box keeps
-    # its own proportion while the picture inside scales.
-    aspect = (APP.native_w, APP.native_h) if upright else (drag.orig_w, drag.orig_h)
-    x, y, w, h = resized_rect(
-        drag.zone,
-        (drag.orig_x, drag.orig_y, drag.orig_w, drag.orig_h),
-        cx - drag.start_x,
-        cy - drag.start_y,
-        aspect[0],
-        aspect[1],
-        MIN_SIZE,
-    )
-    if upright:
-        APP.sw, APP.sh = w, h
-    else:
-        APP.sw = max(1, int(round(drag.orig_sw * w / drag.orig_w)))
-        APP.sh = max(1, int(round(APP.sw * APP.native_h / APP.native_w)))
-        w, h = rotated_size(APP.sw, APP.sh, APP.angle)
-        # Keep the edge opposite the one being dragged where it was.
-        x = drag.orig_x + drag.orig_w - w if "w" in drag.zone else drag.orig_x
-        y = drag.orig_y + drag.orig_h - h if "n" in drag.zone else drag.orig_y
-    APP.x, APP.y, APP.w, APP.h = x, y, w, h
-    APP.surface.frame = -1
-    APP.presented = None
-
-
-def update_drag() -> None:
-    drag = APP.drag
-    if drag is None:
-        apply_cursor(current_zone())
-        return
-    cx, cy = cursor_pos()
-    if drag.zone == "move":
-        APP.x = cx - drag.grab_x
-        APP.y = cy - drag.grab_y
-    elif drag.zone == "rotate":
-        start = math.atan2(drag.start_y - drag.center_y, drag.start_x - drag.center_x)
-        now = math.atan2(cy - drag.center_y, cx - drag.center_x)
-        set_angle(drag.orig_angle + math.degrees(now - start), drag.center_x, drag.center_y)
-    else:
-        resize_drag(drag, cx, cy)
-    apply_cursor(drag.zone)
-    present()
-
-
-def end_drag() -> None:
-    drag, APP.drag = APP.drag, None
-    if drag is not None and drag.zone != "move":
-        # Size or angle changed: frames are drawn again once, then cached.
-        APP.cache_key = None
-        APP.cache = {}
-        APP.surface.frame = -1
-    user32.ReleaseCapture()
-    present()
-    place_handle()
-
-
-def reset_rotation() -> None:
-    if APP.angle == 0:
-        return
-    set_angle(0.0, APP.x + APP.w / 2, APP.y + APP.h / 2)
-    present()
+    gap = MARGIN
+    max_row_w = max(1, int((area.right - area.left) * 0.9))
+    rows: list[list[Player]] = [[]]
+    row_w = 0
+    for player in lined_up:
+        extra = player.w if not rows[-1] else gap + player.w
+        if rows[-1] and row_w + extra > max_row_w:
+            rows.append([player])
+            row_w = player.w
+        else:
+            rows[-1].append(player)
+            row_w += extra
+    sizes = [(sum(p.w for p in row) + gap * (len(row) - 1), max(p.h for p in row)) for row in rows]
+    group_w = max(width for width, _ in sizes)
+    group_h = sum(height for _, height in sizes) + gap * (len(rows) - 1)
+    group_x, group_y = resolve_position(POSITION, group_w, group_h, area)
+    y = group_y
+    for row, (width, height) in zip(rows, sizes):
+        x = group_x + (group_w - width) // 2
+        for player in row:
+            player.x, player.y = x, y + height - player.h
+            x += player.w + gap
+        y += height + gap
 
 
 # ---------------------------------------------------------------------------
-# Rotate button
+# Rotate button image
 # ---------------------------------------------------------------------------
 
 def handle_icon(size: int) -> bytes:
@@ -960,302 +828,27 @@ def handle_icon(size: int) -> bytes:
     return premultiply(small).tobytes()
 
 
-def create_handle(dpi: int) -> None:
-    size = max(14, int(round(ROTATE_BUTTON_PX * dpi / 96)))
-    extended = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-    if ALWAYS_ON_TOP:
-        extended |= WS_EX_TOPMOST
-    # Owned by the picture, so it always sits above it.
-    hwnd = user32.CreateWindowExW(
-        extended, APP.class_name, "GIF Player rotate", WS_POPUP,
-        APP.x, APP.y, size, size, APP.hwnd, None, APP.hinstance, None,
-    )
-    if not hwnd:
-        return                          # no button; everything else still works
-    surface = APP.handle_surface
-    surface.rebuild(size, size)
-    ctypes.memmove(surface.bits, handle_icon(size), size * size * 4)
-    origin, extent, source = POINT(APP.x, APP.y), SIZE(size, size), POINT(0, 0)
-    if not user32.UpdateLayeredWindow(
-        hwnd, None, ctypes.byref(origin), ctypes.byref(extent),
-        surface.mem_dc, ctypes.byref(source), 0, ctypes.byref(BLEND), ULW_ALPHA,
-    ):
-        user32.DestroyWindow(hwnd)
-        return
-    disable_window_chrome(hwnd)
-    APP.handle_hwnd = hwnd
-    APP.handle_size = size
+# ---------------------------------------------------------------------------
+# Shared window helpers
+# ---------------------------------------------------------------------------
+
+def cursor_pos() -> tuple[int, int]:
+    point = POINT()
+    _check(user32.GetCursorPos(ctypes.byref(point)), "GetCursorPos")
+    return int(point.x), int(point.y)
 
 
-def place_handle() -> None:
-    """Keep the button on the box's top-left corner, except mid-rotation."""
-    if not APP.handle_visible:
-        return
-    if APP.drag is not None and APP.drag.zone == "rotate":
-        return                          # stay under the pointer while turning
-    pos = (APP.x + HANDLE_INSET, APP.y + HANDLE_INSET)
-    if pos != APP.handle_pos:
-        user32.SetWindowPos(
-            APP.handle_hwnd, None, pos[0], pos[1], 0, 0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-        )
-        APP.handle_pos = pos
+def apply_cursor(zone: str) -> None:
+    cursor = APP.cursors.get(zone) or APP.cursors.get("move")
+    if cursor:
+        user32.SetCursor(cursor)
 
 
-def show_handle() -> None:
-    if not APP.handle_hwnd or not APP.rotate_enabled:
-        return
-    if not APP.handle_visible:
-        APP.handle_visible = True
-        APP.handle_pos = None
-        place_handle()
-        user32.ShowWindow(APP.handle_hwnd, SW_SHOWNOACTIVATE)
-    # Restarting the timer on every move means it only runs once the pointer
-    # stops or leaves the picture's pixels.
-    user32.SetTimer(APP.hwnd, HOVER_TIMER, HOVER_POLL_MS, None)
-
-
-def hide_handle() -> None:
-    user32.KillTimer(APP.hwnd, HOVER_TIMER)
-    if APP.handle_visible:
-        user32.ShowWindow(APP.handle_hwnd, SW_HIDE)
-        APP.handle_visible = False
-
-
-def check_hover() -> None:
-    if APP.drag is not None:
-        return
-    x, y = cursor_pos()
-    in_box = APP.x <= x < APP.x + APP.w and APP.y <= y < APP.y + APP.h
-    hx, hy = APP.handle_pos or (APP.x, APP.y)
-    size = APP.handle_size
-    on_button = hx <= x < hx + size and hy <= y < hy + size
-    if not (in_box or on_button):
-        hide_handle()
-
-
-def request_quit() -> None:
-    APP.running = False
-    user32.PostQuitMessage(0)
-
-
-def toggle_pause() -> None:
-    now = time.perf_counter()
-    if APP.paused:
-        # Pick up the current frame where it stopped, not from the start.
-        APP.next_frame = now + APP.pause_left
-        APP.paused = False
-    else:
-        APP.pause_left = max(0.0, APP.next_frame - now)
-        APP.paused = True
-
-
-def toggle_rotate() -> None:
-    APP.rotate_enabled = not APP.rotate_enabled
-    if APP.rotate_enabled:
-        # The pointer is usually still on the picture after choosing the item.
-        show_handle()
-    else:
-        hide_handle()
-
-
-def show_menu(hwnd) -> None:
-    if APP.drag is not None:
-        end_drag()
-    menu = user32.CreatePopupMenu()
-    if not menu:
-        return
+def window_dpi(hwnd) -> int:
     try:
-        if len(APP.frames) > 1:
-            label = "Play" if APP.paused else "Pause"
-            if not user32.AppendMenuW(menu, MF_STRING, CMD_PAUSE, label):
-                return
-        if APP.handle_hwnd:
-            label = "Disable rotate" if APP.rotate_enabled else "Enable rotate"
-            if not user32.AppendMenuW(menu, MF_STRING, CMD_ROTATE, label):
-                return
-        if len(APP.frames) > 1 or APP.handle_hwnd:
-            user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        if not user32.AppendMenuW(menu, MF_STRING, CMD_CLOSE, "Close"):
-            return
-        x, y = cursor_pos()
-        # A popup menu only stays open when its owner is the foreground window.
-        user32.SetForegroundWindow(hwnd)
-        command = user32.TrackPopupMenu(
-            menu,
-            TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-            x, y, 0, hwnd, None,
-        )
-        user32.PostMessageW(hwnd, WM_NULL, 0, 0)
-        if command == CMD_PAUSE:
-            toggle_pause()
-        elif command == CMD_ROTATE:
-            toggle_rotate()
-        elif command == CMD_CLOSE:
-            request_quit()
-    finally:
-        user32.DestroyMenu(menu)
-
-
-@WNDPROC
-def wnd_proc(hwnd, msg, wparam, lparam):
-    try:
-        if APP.handle_hwnd and hwnd == APP.handle_hwnd:
-            return handle_proc(hwnd, msg, wparam, lparam)
-        if msg in (WM_DESTROY, WM_CLOSE):
-            APP.running = False
-            if msg == WM_CLOSE:
-                user32.PostQuitMessage(0)
-            return 0
-        if msg == WM_HOTKEY:
-            request_quit()
-            return 0
-        if msg == WM_NCHITTEST:
-            return HTCLIENT
-        if msg == WM_MOUSEACTIVATE:
-            return MA_NOACTIVATE
-        if msg == WM_SETCURSOR:
-            apply_cursor(current_zone())
-            return 1
-        if msg == WM_LBUTTONDOWN:
-            begin_drag()
-            return 0
-        if msg == WM_LBUTTONUP:
-            end_drag()
-            return 0
-        if msg == WM_LBUTTONDBLCLK:
-            reset_rotation()
-            return 0
-        if msg == WM_RBUTTONUP:
-            show_menu(hwnd)
-            return 0
-        if msg == WM_MOUSEMOVE:
-            show_handle()
-            update_drag()
-            return 0
-        if msg == WM_TIMER and wparam == HOVER_TIMER:
-            check_hover()
-            return 0
-        if msg == WM_CAPTURECHANGED:
-            APP.drag = None
-            return 0
-        if msg == WM_ERASEBKGND:
-            return 1
-        if msg == WM_PAINT:
-            user32.ValidateRect(hwnd, None)
-            return 0
-        if msg == WM_SYSCOMMAND:
-            command = int(wparam) & 0xFFF0
-            if command in (SC_MINIMIZE, SC_MAXIMIZE):
-                return 0
-            if command == SC_CLOSE:
-                request_quit()
-                return 0
-        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-    except Exception as exc:
-        APP.error = exc
-        APP.running = False
-        user32.PostQuitMessage(1)
-        return 0
-
-
-def handle_proc(hwnd, msg, wparam, lparam):
-    """Messages for the rotate button window."""
-    if msg in (WM_CLOSE, WM_DESTROY):
-        return 0                        # it goes away with the picture
-    if msg == WM_NCHITTEST:
-        return HTCLIENT
-    if msg == WM_MOUSEACTIVATE:
-        return MA_NOACTIVATE
-    if msg == WM_SETCURSOR:
-        apply_cursor(APP.drag.zone if APP.drag is not None else "rotate")
-        return 1
-    if msg == WM_LBUTTONDOWN:
-        begin_drag("rotate", capture=hwnd)
-        return 0
-    if msg == WM_LBUTTONUP:
-        end_drag()
-        return 0
-    if msg == WM_LBUTTONDBLCLK:
-        reset_rotation()
-        return 0
-    if msg == WM_RBUTTONUP:
-        show_menu(APP.hwnd)
-        return 0
-    if msg == WM_MOUSEMOVE:
-        show_handle()
-        if APP.drag is not None:
-            update_drag()
-        else:
-            apply_cursor("rotate")
-        return 0
-    if msg == WM_CAPTURECHANGED:
-        APP.drag = None
-        return 0
-    if msg == WM_ERASEBKGND:
-        return 1
-    if msg == WM_PAINT:
-        user32.ValidateRect(hwnd, None)
-        return 0
-    return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-
-
-def create_window() -> None:
-    APP.hinstance = kernel32.GetModuleHandleW(None)
-    for zone, cursor_id in _CURSOR_IDS.items():
-        APP.cursors[zone] = user32.LoadCursorW(None, ctypes.c_void_p(cursor_id))
-
-    window_class = WNDCLASSW()
-    window_class.style = CS_DBLCLKS
-    window_class.lpfnWndProc = wnd_proc
-    window_class.hInstance = APP.hinstance
-    window_class.hCursor = APP.cursors.get("move")
-    window_class.lpszClassName = APP.class_name
-    atom = user32.RegisterClassW(ctypes.byref(window_class))
-    if not atom and ctypes.get_last_error() not in (0, 1410):
-        raise ctypes.WinError(ctypes.get_last_error(), "RegisterClassW failed")
-
-    extended = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP
-    if ALWAYS_ON_TOP:
-        extended |= WS_EX_TOPMOST
-    hwnd = user32.CreateWindowExW(
-        extended, APP.class_name, "GIF Player", WS_POPUP,
-        APP.x, APP.y, APP.w, APP.h, None, None, APP.hinstance, None,
-    )
-    if not hwnd:
-        extended &= ~WS_EX_NOREDIRECTIONBITMAP
-        hwnd = user32.CreateWindowExW(
-            extended, APP.class_name, "GIF Player", WS_POPUP,
-            APP.x, APP.y, APP.w, APP.h, None, None, APP.hinstance, None,
-        )
-    APP.hwnd = _check(hwnd, "CreateWindowExW")
-    try:
-        dpi = int(user32.GetDpiForWindow(APP.hwnd) or 96)
+        return int(user32.GetDpiForWindow(hwnd) or 96)
     except Exception:
-        dpi = 96
-    APP.edge_px = max(2, int(round(EDGE_PX * dpi / 96)))
-    create_handle(dpi)
-
-    modifiers = MOD_NOREPEAT
-    for name in QUIT_MODIFIERS:
-        key = str(name).lower()
-        if key not in _MODIFIERS:
-            fail("QUIT_MODIFIERS can contain ctrl, shift, alt, and win.")
-        modifiers |= _MODIFIERS[key]
-    quit_key = str(QUIT_KEY).lower()
-    virtual_key = _NAMED_KEYS.get(quit_key, ord(quit_key.upper()) if len(quit_key) == 1 else 0)
-    if not virtual_key:
-        fail("QUIT_KEY must be a single character, esc, or space.")
-    APP.hotkey = bool(user32.RegisterHotKey(APP.hwnd, 1, modifiers, virtual_key))
-    if not APP.hotkey:
-        user32.MessageBoxW(
-            None,
-            "Ctrl+Shift+Q is already used by another program.\n"
-            "End pythonw.exe in Task Manager to close the player.",
-            "GIF Player",
-            0x30,
-        )
-    disable_window_chrome(APP.hwnd)
+        return 96
 
 
 def disable_window_chrome(hwnd) -> None:
@@ -1278,69 +871,658 @@ def disable_window_chrome(hwnd) -> None:
     set_attr(34, 0xFFFFFFFE)   # DWMWA_BORDER_COLOR = none
 
 
+def request_quit() -> None:
+    APP.running = False
+    user32.PostQuitMessage(0)
+
+
+# ---------------------------------------------------------------------------
+# One GIF window
+# ---------------------------------------------------------------------------
+
+class Player:
+    """One GIF in its own window, with its own rotate button."""
+
+    def __init__(self, spec: dict, area: RECT) -> None:
+        self.name = spec["file"]
+        self.position = spec["position"]
+        self.frames, self.native_bytes, self.delays, native = load_gif(
+            gif_path(self.name), spec["speed"]
+        )
+        self.native_w, self.native_h = native
+        self.index = 0
+        # The window box. When rotated it is larger than the picture.
+        self.w, self.h = initial_size(self.native_w, self.native_h, spec["scale"], area)
+        self.x = 0
+        self.y = 0
+        # The picture's own size before rotation, and the rotation in degrees
+        # clockwise. 0 is upright.
+        self.sw, self.sh = self.w, self.h
+        self.angle = 0.0
+        self.hwnd = None
+        self.edge_px = EDGE_PX
+        self.drag: Drag | None = None
+        self.surface = Surface()
+        self.cache_key: tuple[int, int, float] | None = None
+        self.cache: dict[int, bytes] = {}
+        self.presented: tuple[int, int, int, int, int] | None = None
+        self.in_present = False
+        self.next_frame = 0.0
+        self.paused = False
+        # Time the current frame still had on screen when Pause was chosen.
+        self.pause_left = 0.0
+        self.closing = False
+        # The rotate button: a small window of its own, shown on hover while
+        # rotating is enabled from the menu.
+        self.rotate_enabled = spec["rotate"]
+        self.handle_hwnd = None
+        self.handle_surface = Surface()
+        self.handle_size = ROTATE_BUTTON_PX
+        self.handle_visible = False
+        self.handle_pos: tuple[int, int] | None = None
+
+    @property
+    def animated(self) -> bool:
+        return len(self.frames) > 1
+
+    @property
+    def playing(self) -> bool:
+        return self.animated and not self.paused and not self.closing
+
+    # -- windows ------------------------------------------------------------
+
+    def create_windows(self) -> None:
+        extended = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP
+        if ALWAYS_ON_TOP:
+            extended |= WS_EX_TOPMOST
+        title = f"GIF Player - {self.name}"
+        hwnd = user32.CreateWindowExW(
+            extended, APP.class_name, title, WS_POPUP,
+            self.x, self.y, self.w, self.h, None, None, APP.hinstance, None,
+        )
+        if not hwnd:
+            extended &= ~WS_EX_NOREDIRECTIONBITMAP
+            hwnd = user32.CreateWindowExW(
+                extended, APP.class_name, title, WS_POPUP,
+                self.x, self.y, self.w, self.h, None, None, APP.hinstance, None,
+            )
+        self.hwnd = _check(hwnd, "CreateWindowExW")
+        APP.windows[self.hwnd] = (self, False)
+        dpi = window_dpi(self.hwnd)
+        self.edge_px = max(2, int(round(EDGE_PX * dpi / 96)))
+        disable_window_chrome(self.hwnd)
+        self.create_handle(dpi)
+
+    def create_handle(self, dpi: int) -> None:
+        size = max(14, int(round(ROTATE_BUTTON_PX * dpi / 96)))
+        extended = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+        if ALWAYS_ON_TOP:
+            extended |= WS_EX_TOPMOST
+        # Owned by the picture, so it always sits above it.
+        hwnd = user32.CreateWindowExW(
+            extended, APP.class_name, "GIF Player rotate", WS_POPUP,
+            self.x, self.y, size, size, self.hwnd, None, APP.hinstance, None,
+        )
+        if not hwnd:
+            return                      # no button; everything else still works
+        surface = self.handle_surface
+        surface.rebuild(size, size)
+        ctypes.memmove(surface.bits, handle_icon(size), size * size * 4)
+        origin, extent, source = POINT(self.x, self.y), SIZE(size, size), POINT(0, 0)
+        if not user32.UpdateLayeredWindow(
+            hwnd, None, ctypes.byref(origin), ctypes.byref(extent),
+            surface.mem_dc, ctypes.byref(source), 0, ctypes.byref(BLEND), ULW_ALPHA,
+        ):
+            user32.DestroyWindow(hwnd)
+            return
+        disable_window_chrome(hwnd)
+        self.handle_hwnd = hwnd
+        self.handle_size = size
+        APP.windows[hwnd] = (self, True)
+
+    def show(self) -> None:
+        self.present()
+        user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
+        if ALWAYS_ON_TOP:
+            user32.SetWindowPos(
+                self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        self.present()
+
+    def request_close(self) -> None:
+        """Close this GIF. The main loop tears it down after this message."""
+        self.closing = True
+        if self.hwnd:
+            user32.PostMessageW(self.hwnd, WM_NULL, 0, 0)
+
+    def destroy(self) -> None:
+        if self.hwnd:
+            user32.KillTimer(self.hwnd, HOVER_TIMER)
+            # Also destroys the rotate button, which it owns.
+            user32.DestroyWindow(self.hwnd)
+        APP.windows.pop(self.hwnd, None)
+        APP.windows.pop(self.handle_hwnd, None)
+        self.hwnd = None
+        self.handle_hwnd = None
+        self.surface.close()
+        self.handle_surface.close()
+        self.cache = {}
+
+    # -- frames -------------------------------------------------------------
+
+    def start_clock(self, now: float) -> None:
+        self.next_frame = now + self.delays[self.index] / 1000
+
+    def tick(self, now: float) -> None:
+        if not self.playing or now < self.next_frame:
+            return
+        self.index = (self.index + 1) % len(self.frames)
+        # Count from the deadline, not from when Windows woke us. Wake-ups
+        # land on a ~15.6 ms tick, and counting from "now" made every frame
+        # that much too long.
+        self.next_frame += self.delays[self.index] / 1000
+        if self.next_frame <= now:
+            # A whole frame behind (menu open, PC asleep): restart the clock
+            # instead of racing through frames to catch up.
+            self.next_frame = now + self.delays[self.index] / 1000
+
+    def render_frame(self, index: int, width: int, height: int) -> bytes:
+        """Frame `index` at the current size and angle, as premultiplied BGRA."""
+        frame = self.frames[index]
+        sw, sh, angle = self.sw, self.sh, self.angle
+        if angle == 0:
+            if frame.size != (sw, sh):
+                frame = frame.resize((sw, sh), _FILTERS[RESAMPLE])
+            return frame.tobytes()
+        # Scale and rotate in one step: map each pixel of the window box back
+        # to the GIF frame around both centres.
+        native_w, native_h = frame.size
+        turn = math.radians(angle)
+        cos, sin = round(math.cos(turn), 12), round(math.sin(turn), 12)
+        step_x, step_y = native_w / sw, native_h / sh
+        a, b = cos * step_x, sin * step_x
+        d, e = -sin * step_y, cos * step_y
+        c = native_w / 2 - a * width / 2 - b * height / 2
+        f = native_h / 2 - d * width / 2 - e * height / 2
+        if angle % 90 == 0 or RESAMPLE != "nearest":
+            resample = _ROTATE_FILTERS[RESAMPLE]
+        else:
+            # Hard pixels look torn at a slant; smooth them.
+            resample = Image.Resampling.BILINEAR
+        rotated = frame.transform(
+            (width, height), Image.Transform.AFFINE, (a, b, c, d, e, f), resample
+        )
+        return rotated.tobytes()
+
+    def frame_pixels(self, index: int, width: int, height: int) -> bytes:
+        if self.angle == 0 and (self.sw, self.sh) == (self.native_w, self.native_h):
+            return self.native_bytes[index]
+        reshaping = self.drag is not None and self.drag.zone != "move"
+        if reshaping:
+            return self.render_frame(index, width, height)
+        frame_bytes = width * height * 4
+        if frame_bytes * len(self.frames) > 32 * 1024 * 1024:
+            return self.render_frame(index, width, height)
+        key = (self.sw, self.sh, self.angle)
+        if self.cache_key != key:
+            self.cache_key = key
+            self.cache = {}
+        cached = self.cache.get(index)
+        if cached is None:
+            cached = self.render_frame(index, width, height)
+            self.cache[index] = cached
+        return cached
+
+    def present(self) -> None:
+        if self.in_present or not self.hwnd or self.closing:
+            return
+        self.in_present = True
+        try:
+            width, height = self.w, self.h
+            if width < 1 or height < 1:
+                return
+            if self.surface.size != (width, height):
+                self.surface.rebuild(width, height)
+            if self.surface.frame != self.index:
+                data = self.frame_pixels(self.index, width, height)
+                ctypes.memmove(self.surface.bits, data, width * height * 4)
+                self.surface.frame = self.index
+            key = (self.index, self.x, self.y, width, height)
+            if key == self.presented:
+                return
+            origin = POINT(self.x, self.y)
+            size = SIZE(width, height)
+            source = POINT(0, 0)
+            ok = user32.UpdateLayeredWindow(
+                self.hwnd, None, ctypes.byref(origin), ctypes.byref(size),
+                self.surface.mem_dc, ctypes.byref(source), 0, ctypes.byref(BLEND), ULW_ALPHA,
+            )
+            if not ok:
+                raise ctypes.WinError(ctypes.get_last_error(), "UpdateLayeredWindow failed")
+            self.presented = key
+            self.place_handle()
+        except Exception as exc:
+            APP.error = exc
+            APP.running = False
+        finally:
+            self.in_present = False
+
+    # -- dragging -----------------------------------------------------------
+
+    def current_zone(self) -> str:
+        if self.drag is not None:
+            return self.drag.zone
+        cx, cy = cursor_pos()
+        return hit_zone(cx - self.x, cy - self.y, self.w, self.h, self.edge_px)
+
+    def begin_drag(self, zone: str | None = None, capture=None) -> None:
+        cx, cy = cursor_pos()
+        if zone is None:
+            zone = hit_zone(cx - self.x, cy - self.y, self.w, self.h, self.edge_px)
+        self.drag = Drag(self, zone, cx, cy)
+        user32.SetCapture(capture or self.hwnd)
+        apply_cursor(zone)
+
+    def set_angle(self, angle: float, center_x: float, center_y: float) -> None:
+        """Rotate to `angle` degrees clockwise, keeping the centre still."""
+        angle %= 360.0
+        straight = round(angle / 90) * 90
+        if abs(angle - straight) < ROTATE_SNAP:
+            angle = float(straight % 360)
+        if angle == self.angle:
+            return
+        self.angle = angle
+        self.w, self.h = rotated_size(self.sw, self.sh, angle)
+        self.x = int(round(center_x - self.w / 2))
+        self.y = int(round(center_y - self.h / 2))
+        self.surface.frame = -1
+        self.presented = None
+
+    def resize_drag(self, drag: Drag, cx: int, cy: int) -> None:
+        upright = drag.orig_angle == 0
+        # Upright, keep the GIF's own proportion exactly. Rotated, the box
+        # keeps its own proportion while the picture inside scales.
+        aspect = (self.native_w, self.native_h) if upright else (drag.orig_w, drag.orig_h)
+        x, y, w, h = resized_rect(
+            drag.zone,
+            (drag.orig_x, drag.orig_y, drag.orig_w, drag.orig_h),
+            cx - drag.start_x,
+            cy - drag.start_y,
+            aspect[0],
+            aspect[1],
+            MIN_SIZE,
+        )
+        if upright:
+            self.sw, self.sh = w, h
+        else:
+            self.sw = max(1, int(round(drag.orig_sw * w / drag.orig_w)))
+            self.sh = max(1, int(round(self.sw * self.native_h / self.native_w)))
+            w, h = rotated_size(self.sw, self.sh, self.angle)
+            # Keep the edge opposite the one being dragged where it was.
+            x = drag.orig_x + drag.orig_w - w if "w" in drag.zone else drag.orig_x
+            y = drag.orig_y + drag.orig_h - h if "n" in drag.zone else drag.orig_y
+        self.x, self.y, self.w, self.h = x, y, w, h
+        self.surface.frame = -1
+        self.presented = None
+
+    def update_drag(self) -> None:
+        drag = self.drag
+        if drag is None:
+            apply_cursor(self.current_zone())
+            return
+        cx, cy = cursor_pos()
+        if drag.zone == "move":
+            self.x = cx - drag.grab_x
+            self.y = cy - drag.grab_y
+        elif drag.zone == "rotate":
+            start = math.atan2(drag.start_y - drag.center_y, drag.start_x - drag.center_x)
+            now = math.atan2(cy - drag.center_y, cx - drag.center_x)
+            self.set_angle(drag.orig_angle + math.degrees(now - start), drag.center_x, drag.center_y)
+        else:
+            self.resize_drag(drag, cx, cy)
+        apply_cursor(drag.zone)
+        self.present()
+
+    def end_drag(self) -> None:
+        drag, self.drag = self.drag, None
+        if drag is not None and drag.zone != "move":
+            # Size or angle changed: frames are drawn again once, then cached.
+            self.cache_key = None
+            self.cache = {}
+            self.surface.frame = -1
+        user32.ReleaseCapture()
+        self.present()
+        self.place_handle()
+
+    def reset_rotation(self) -> None:
+        if self.angle == 0:
+            return
+        self.set_angle(0.0, self.x + self.w / 2, self.y + self.h / 2)
+        self.present()
+
+    # -- rotate button ------------------------------------------------------
+
+    def place_handle(self) -> None:
+        """Keep the button on the box's top-left corner, except mid-rotation."""
+        if not self.handle_visible:
+            return
+        if self.drag is not None and self.drag.zone == "rotate":
+            return                      # stay under the pointer while turning
+        pos = (self.x + HANDLE_INSET, self.y + HANDLE_INSET)
+        if pos != self.handle_pos:
+            user32.SetWindowPos(
+                self.handle_hwnd, None, pos[0], pos[1], 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            self.handle_pos = pos
+
+    def show_handle(self) -> None:
+        if not self.handle_hwnd or not self.rotate_enabled:
+            return
+        if not self.handle_visible:
+            self.handle_visible = True
+            self.handle_pos = None
+            self.place_handle()
+            user32.ShowWindow(self.handle_hwnd, SW_SHOWNOACTIVATE)
+        # Restarting the timer on every move means it only runs once the
+        # pointer stops or leaves the picture's pixels.
+        user32.SetTimer(self.hwnd, HOVER_TIMER, HOVER_POLL_MS, None)
+
+    def hide_handle(self) -> None:
+        user32.KillTimer(self.hwnd, HOVER_TIMER)
+        if self.handle_visible:
+            user32.ShowWindow(self.handle_hwnd, SW_HIDE)
+            self.handle_visible = False
+
+    def check_hover(self) -> None:
+        if self.drag is not None:
+            return
+        x, y = cursor_pos()
+        in_box = self.x <= x < self.x + self.w and self.y <= y < self.y + self.h
+        hx, hy = self.handle_pos or (self.x, self.y)
+        size = self.handle_size
+        on_button = hx <= x < hx + size and hy <= y < hy + size
+        if not (in_box or on_button):
+            self.hide_handle()
+
+    # -- menu ---------------------------------------------------------------
+
+    def toggle_pause(self) -> None:
+        now = time.perf_counter()
+        if self.paused:
+            # Pick up the current frame where it stopped, not from the start.
+            self.next_frame = now + self.pause_left
+            self.paused = False
+        else:
+            self.pause_left = max(0.0, self.next_frame - now)
+            self.paused = True
+
+    def toggle_rotate(self) -> None:
+        self.rotate_enabled = not self.rotate_enabled
+        if self.rotate_enabled:
+            # The pointer is usually still on the picture after choosing it.
+            self.show_handle()
+        else:
+            self.hide_handle()
+
+    def show_menu(self) -> None:
+        if self.drag is not None:
+            self.end_drag()
+        menu = user32.CreatePopupMenu()
+        if not menu:
+            return
+        try:
+            if self.animated:
+                label = "Play" if self.paused else "Pause"
+                if not user32.AppendMenuW(menu, MF_STRING, CMD_PAUSE, label):
+                    return
+            if self.handle_hwnd:
+                label = "Disable rotate" if self.rotate_enabled else "Enable rotate"
+                if not user32.AppendMenuW(menu, MF_STRING, CMD_ROTATE, label):
+                    return
+            if self.animated or self.handle_hwnd:
+                user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            if not user32.AppendMenuW(menu, MF_STRING, CMD_CLOSE, "Close"):
+                return
+            if len(APP.players) > 1:
+                user32.AppendMenuW(menu, MF_STRING, CMD_CLOSE_ALL, "Close all")
+            x, y = cursor_pos()
+            # A popup menu only stays open when its owner is the foreground
+            # window.
+            user32.SetForegroundWindow(self.hwnd)
+            command = user32.TrackPopupMenu(
+                menu,
+                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                x, y, 0, self.hwnd, None,
+            )
+            user32.PostMessageW(self.hwnd, WM_NULL, 0, 0)
+            if command == CMD_PAUSE:
+                self.toggle_pause()
+            elif command == CMD_ROTATE:
+                self.toggle_rotate()
+            elif command == CMD_CLOSE:
+                self.request_close()
+            elif command == CMD_CLOSE_ALL:
+                request_quit()
+        finally:
+            user32.DestroyMenu(menu)
+
+    # -- messages -----------------------------------------------------------
+
+    def main_proc(self, hwnd, msg, wparam, lparam):
+        if msg == WM_DESTROY:
+            return 0
+        if msg == WM_CLOSE:
+            self.request_close()
+            return 0
+        if msg == WM_NCHITTEST:
+            return HTCLIENT
+        if msg == WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE
+        if msg == WM_SETCURSOR:
+            apply_cursor(self.current_zone())
+            return 1
+        if msg == WM_LBUTTONDOWN:
+            self.begin_drag()
+            return 0
+        if msg == WM_LBUTTONUP:
+            self.end_drag()
+            return 0
+        if msg == WM_LBUTTONDBLCLK:
+            self.reset_rotation()
+            return 0
+        if msg == WM_RBUTTONUP:
+            self.show_menu()
+            return 0
+        if msg == WM_MOUSEMOVE:
+            self.show_handle()
+            self.update_drag()
+            return 0
+        if msg == WM_TIMER and wparam == HOVER_TIMER:
+            self.check_hover()
+            return 0
+        if msg == WM_CAPTURECHANGED:
+            self.drag = None
+            return 0
+        if msg == WM_ERASEBKGND:
+            return 1
+        if msg == WM_PAINT:
+            user32.ValidateRect(hwnd, None)
+            return 0
+        if msg == WM_SYSCOMMAND:
+            command = int(wparam) & 0xFFF0
+            if command in (SC_MINIMIZE, SC_MAXIMIZE):
+                return 0
+            if command == SC_CLOSE:
+                self.request_close()
+                return 0
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def handle_proc(self, hwnd, msg, wparam, lparam):
+        """Messages for the rotate button window."""
+        if msg in (WM_CLOSE, WM_DESTROY):
+            return 0                    # it goes away with the picture
+        if msg == WM_NCHITTEST:
+            return HTCLIENT
+        if msg == WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE
+        if msg == WM_SETCURSOR:
+            apply_cursor(self.drag.zone if self.drag is not None else "rotate")
+            return 1
+        if msg == WM_LBUTTONDOWN:
+            self.begin_drag("rotate", capture=hwnd)
+            return 0
+        if msg == WM_LBUTTONUP:
+            self.end_drag()
+            return 0
+        if msg == WM_LBUTTONDBLCLK:
+            self.reset_rotation()
+            return 0
+        if msg == WM_RBUTTONUP:
+            self.show_menu()
+            return 0
+        if msg == WM_MOUSEMOVE:
+            self.show_handle()
+            if self.drag is not None:
+                self.update_drag()
+            else:
+                apply_cursor("rotate")
+            return 0
+        if msg == WM_CAPTURECHANGED:
+            self.drag = None
+            return 0
+        if msg == WM_ERASEBKGND:
+            return 1
+        if msg == WM_PAINT:
+            user32.ValidateRect(hwnd, None)
+            return 0
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+@WNDPROC
+def wnd_proc(hwnd, msg, wparam, lparam):
+    try:
+        entry = APP.windows.get(hwnd)
+        if entry is None:
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+        player, is_button = entry
+        if is_button:
+            return player.handle_proc(hwnd, msg, wparam, lparam)
+        return player.main_proc(hwnd, msg, wparam, lparam)
+    except Exception as exc:
+        APP.error = exc
+        APP.running = False
+        user32.PostQuitMessage(1)
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Start, loop, stop
+# ---------------------------------------------------------------------------
+
+def register_class() -> None:
+    APP.hinstance = kernel32.GetModuleHandleW(None)
+    for zone, cursor_id in _CURSOR_IDS.items():
+        APP.cursors[zone] = user32.LoadCursorW(None, ctypes.c_void_p(cursor_id))
+    window_class = WNDCLASSW()
+    window_class.style = CS_DBLCLKS
+    window_class.lpfnWndProc = wnd_proc
+    window_class.hInstance = APP.hinstance
+    window_class.hCursor = APP.cursors.get("move")
+    window_class.lpszClassName = APP.class_name
+    atom = user32.RegisterClassW(ctypes.byref(window_class))
+    if not atom and ctypes.get_last_error() not in (0, 1410):
+        raise ctypes.WinError(ctypes.get_last_error(), "RegisterClassW failed")
+    APP.class_registered = True
+
+
+def register_hotkey() -> None:
+    modifiers = MOD_NOREPEAT
+    for name in QUIT_MODIFIERS:
+        key = str(name).lower()
+        if key not in _MODIFIERS:
+            fail("QUIT_MODIFIERS can contain ctrl, shift, alt, and win.")
+        modifiers |= _MODIFIERS[key]
+    quit_key = str(QUIT_KEY).lower()
+    virtual_key = _NAMED_KEYS.get(quit_key, ord(quit_key.upper()) if len(quit_key) == 1 else 0)
+    if not virtual_key:
+        fail("QUIT_KEY must be a single character, esc, or space.")
+    # Registered to the thread, not a window, so it keeps working whichever
+    # GIFs have been closed.
+    APP.hotkey = bool(user32.RegisterHotKey(None, HOTKEY_ID, modifiers, virtual_key))
+    if not APP.hotkey:
+        user32.MessageBoxW(
+            None,
+            "Ctrl+Shift+Q is already used by another program.\n"
+            "Right-click a GIF and choose Close all to close the player.",
+            "GIF Player",
+            0x30,
+        )
+
+
 def pump() -> None:
     message = MSG()
     while user32.PeekMessageW(ctypes.byref(message), None, 0, 0, PM_REMOVE):
         if message.message == WM_QUIT:
             APP.running = False
             return
+        if message.message == WM_HOTKEY and not message.hwnd:
+            request_quit()
+            continue
         user32.TranslateMessage(ctypes.byref(message))
         user32.DispatchMessageW(ctypes.byref(message))
 
 
+def reap_closed() -> None:
+    for player in [p for p in APP.players if p.closing]:
+        player.destroy()
+        APP.players.remove(player)
+    if not APP.players:
+        APP.running = False
+
+
 def run() -> None:
-    present()
-    user32.ShowWindow(APP.hwnd, SW_SHOWNOACTIVATE)
-    if ALWAYS_ON_TOP:
-        user32.SetWindowPos(
-            APP.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        )
-    present()
-    APP.next_frame = time.perf_counter() + APP.delays[APP.index] / 1000
-    animated = len(APP.frames) > 1
+    for player in APP.players:
+        player.show()
+    now = time.perf_counter()
+    for player in APP.players:
+        player.start_clock(now)
     while APP.running:
-        playing = animated and not APP.paused
         now = time.perf_counter()
-        if playing and now >= APP.next_frame:
-            APP.index = (APP.index + 1) % len(APP.frames)
-            # Count from the deadline, not from when Windows woke us. Wake-ups
-            # land on a ~15.6 ms tick, and counting from "now" made every frame
-            # that much too long.
-            APP.next_frame += APP.delays[APP.index] / 1000
-            if APP.next_frame <= now:
-                # A whole frame behind (menu open, PC asleep): restart the clock
-                # instead of racing through frames to catch up.
-                APP.next_frame = now + APP.delays[APP.index] / 1000
-        present()
+        wake = None
+        for player in APP.players:
+            player.tick(now)
+            player.present()
+            if player.playing:
+                wake = player.next_frame if wake is None else min(wake, player.next_frame)
         if not APP.running:
             break
-        if playing:
-            remaining = APP.next_frame - time.perf_counter()
+        if wake is None:
+            # Every GIF paused or still: sleep until a click, the hotkey or Close.
+            wait_ms = INFINITE
+        else:
+            remaining = wake - time.perf_counter()
             if remaining <= 0:
                 continue
             # Round up so the wait never ends just before the deadline and
             # needs a second wake-up for the same frame.
             wait_ms = min(1000, max(1, math.ceil(remaining * 1000)))
-        else:
-            # Paused or a still image: sleep until a click, the hotkey or Close.
-            wait_ms = INFINITE
         user32.MsgWaitForMultipleObjects(0, None, False, wait_ms, QS_ALLINPUT)
         pump()
+        reap_closed()
 
 
 def cleanup() -> None:
-    if APP.hotkey and APP.hwnd:
-        user32.UnregisterHotKey(APP.hwnd, 1)
-    APP.surface.close()
-    APP.handle_surface.close()
-    if APP.hwnd:
-        user32.KillTimer(APP.hwnd, HOVER_TIMER)
-        # Also destroys the rotate button, which it owns.
-        user32.DestroyWindow(APP.hwnd)
-        APP.hwnd = None
-    if APP.hinstance:
+    if APP.hotkey:
+        user32.UnregisterHotKey(None, HOTKEY_ID)
+        APP.hotkey = False
+    for player in APP.players:
+        player.destroy()
+    APP.players = []
+    if APP.class_registered:
         user32.UnregisterClassW(APP.class_name, APP.hinstance)
+        APP.class_registered = False
 
 
 def main() -> None:
@@ -1349,17 +1531,15 @@ def main() -> None:
     enable_dpi()
     bind_win32()
     check_settings()
-    frames, native_bytes, delays, native = load_gif(gif_path(), float(SPEED))
-    APP.frames = frames
-    APP.native_bytes = native_bytes
-    APP.delays = delays
-    APP.native_w, APP.native_h = native
+    specs = gif_specs()
     area = work_area()
-    APP.w, APP.h = initial_size(APP.native_w, APP.native_h, float(SCALE), area)
-    APP.sw, APP.sh = APP.w, APP.h
-    APP.x, APP.y = resolve_position(POSITION, APP.w, APP.h, area)
-    create_window()
+    APP.players = [Player(spec, area) for spec in specs]
+    lay_out(APP.players, area)
     try:
+        register_class()
+        for player in APP.players:
+            player.create_windows()
+        register_hotkey()
         run()
     finally:
         cleanup()
